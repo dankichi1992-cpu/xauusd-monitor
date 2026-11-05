@@ -1,0 +1,168 @@
+name: XAUUSD monitor
+on:
+  schedule:
+    - cron: '3,18,33,48 * * * *'
+  workflow_dispatch:
+    inputs:
+      test_push:
+        description: '実データの接続テストをiPhoneへ送る'
+        type: boolean
+        default: true
+permissions:
+  contents: write
+concurrency:
+  group: xauusd-monitor
+  cancel-in-progress: false
+jobs:
+  monitor:
+    if: github.event.repository.private == false && github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Check closed gold candles
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          TEST_PUSH: ${{ github.event.inputs.test_push }}
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/xauusd.cjs" <<'MONITOR_JS'
+          'use strict';
+          const assert = require('node:assert/strict');
+          const M = 900, H = 3600;
+          const symbol = 'frxXAUUSD';
+          const now = () => Math.floor(Date.now() / 1000);
+          const jst = t => new Date(t * 1000).toLocaleString('sv-SE', {timeZone:'Asia/Tokyo'});
+          const money = n => n.toFixed(2);
+
+          async function history(seconds, end) {
+            const request = {ticks_history:symbol, end, count:seconds ? 650 : 1, adjust_start_time:1,
+              style:seconds ? 'candles' : 'ticks'};
+            if (seconds) request.granularity = seconds;
+            return new Promise((resolve,reject) => {
+              const ws = new WebSocket('wss://api.derivws.com/trading/v1/options/ws/public');
+              const timer = setTimeout(() => done(new Error('Deriv timed out')), 25000);
+              function done(error, body) {
+                clearTimeout(timer);
+                ws.close();
+                if (error) reject(error); else resolve(body);
+              }
+              ws.onopen = () => ws.send(JSON.stringify(request));
+              ws.onerror = () => done(new Error('Deriv connection failed'));
+              ws.onclose = () => {clearTimeout(timer); reject(new Error('Deriv closed the connection'));};
+              ws.onmessage = event => {
+                try {
+                  const data = JSON.parse(event.data);
+                  if (data.error) throw new Error('Deriv: ' + data.error.code);
+                  assert.equal(data.echo_req.ticks_history,symbol);
+                  done(null, seconds ? data.candles : Number(data.history.times.at(-1)));
+                } catch (e) {done(e);}
+              };
+            });
+          }
+
+          function bars(raw, step, end) {
+            const out = [];
+            let fast, slow;
+            for (const row of raw) {
+              const t = Number(row.epoch);
+              if (t + step > end) continue;
+              const [o,h,l,c] = ['open','high','low','close'].map(k => Number(row[k]));
+              assert(Number.isInteger(t) && t % step === 0 && (!out.length || t > out.at(-1).t));
+              assert([o,h,l,c].every(n => Number.isFinite(n) && n > 0));
+              assert(l <= Math.min(o,c) && h >= Math.max(o,c));
+              fast = fast === undefined ? c : fast + 2/21*(c-fast);
+              slow = slow === undefined ? c : slow + 2/51*(c-slow);
+              out.push({t,h,l,c,fast,slow});
+            }
+            assert(out.length >= 160, 'insufficient EMA warmup');
+            return out;
+          }
+
+          function setup(m,h,i) {
+            const a=m[i], b=m[i-1], end=a.t+M;
+            const k=h.findLastIndex(v => v.t+H<=end);
+            if (k<150 || h[k].t+H !== Math.floor(end/H)*H || b.t+M!==a.t) return null;
+            const u=h[k], range=m.slice(i-13,i-1);
+            for (const d of [1,-1]) {
+              const trend=(v,prev)=>d*(v.c-v.fast)>0 && d*(v.fast-v.slow)>0 && d*(v.fast-prev.fast)>0;
+              const level=d===1 ? Math.max(...range.map(v=>v.h)) : Math.min(...range.map(v=>v.l));
+              if (d*(a.c-level)>0 && d*(b.c-level)>0 && trend(a,m[i-2]) && trend(u,h[k-1]))
+                return {d,level,a,b,u,end};
+            }
+            return null;
+          }
+
+          function status(m,h,tick,clock) {
+            const end=m.at(-1).t+M;
+            if (!Number.isFinite(tick) || tick>clock+5 || clock-tick>180 || end>tick ||
+                end!==Math.floor(clock/M)*M || h.at(-1).t+H!==Math.floor(end/H)*H) return '休場・更新待ち';
+            return '同期済み';
+          }
+          function eligible(m,h,last) {
+            const i=m.length-1, s=setup(m,h,i);
+            if (!s || setup(m,h,i-1)?.d===s.d || last>=s.end || (last && m[i-15].t+M<=last)) return null;
+            return s;
+          }
+          function message(s,tick) {
+            const up=s.d===1, side=up?'上昇':'下落', op=up?'＞':'＜';
+            return {title:'XAUUSD '+side+'｜確定足',message:[
+              '確認価格 '+money(s.a.c)+' USD　'+jst(s.end)+' JST',
+              '直前12本の'+(up?'高値':'安値')+' '+money(s.level)+' を更新。15分終値 '+money(s.b.c)+' → '+money(s.a.c)+' で定着。',
+              ...[['15分',s.a],['1時間',s.u]].map(([name,v])=>name+' 終値 '+money(v.c)+op+'EMA20 '+money(v.fast)+op+'EMA50 '+money(v.slow)+'、EMA20は'+side),
+              '否定条件：15分終値が '+money(s.level)+' を'+(up?'下回る':'上回る')+'。',
+              '1時間足確定 '+jst(s.u.t+H)+' JST　最終ティック '+jst(tick)+' JST',
+              '判定 '+jst(now())+' JST｜Deriv Gold/USD'].join('\n')};
+          }
+          async function notify(payload) {
+            const topic=process.env.NTFY_TOPIC;
+            assert(/^[A-Za-z0-9_-]{24,64}$/.test(topic||''),'NTFY_TOPIC must be 24–64 random URL-safe characters');
+            const r=await fetch('https://ntfy.sh',{method:'POST',headers:{'Content-Type':'application/json'},
+              body:JSON.stringify({topic,...payload}),signal:AbortSignal.timeout(10000)});
+            if (!r.ok) throw new Error('ntfy HTTP '+r.status);
+            assert((await r.json()).id,'ntfy did not return a message ID');
+          }
+          async function stateApi(method,body) {
+            const branch=process.env.GITHUB_REF_NAME;
+            const base='https://api.github.com/repos/'+process.env.GITHUB_REPOSITORY+'/contents/monitor-state.json';
+            const r=await fetch(base+(method==='GET'?'?ref='+encodeURIComponent(branch):''),{method,
+              headers:{Authorization:'Bearer '+process.env.GH_TOKEN,'Content-Type':'application/json'},
+              body:body && JSON.stringify({...body,branch}),signal:AbortSignal.timeout(10000)});
+            if (r.status===404 && method==='GET') return {last:0};
+            assert(r.ok,'GitHub state HTTP '+r.status);
+            const data=await r.json();
+            if (method==='GET') {
+              const {last}=JSON.parse(Buffer.from(data.content,'base64').toString());
+              assert(Number.isSafeInteger(last)&&last>0);
+              return {last,sha:data.sha};
+            }
+          }
+          async function run() {
+            const clock=now();
+            const [mraw,hraw,tick]=await Promise.all([history(M,'latest'),history(H,'latest'),history(0,'latest')]);
+            const m=bars(mraw,M,clock), h=bars(hraw,H,clock);
+            const state=status(m,h,tick,now());
+            const report='Deriv XAUUSD｜'+state+'\n15分足 '+jst(m.at(-1).t+M)+' JST 終値 '+money(m.at(-1).c)+
+              '\n1時間足 '+jst(h.at(-1).t+H)+' JST 終値 '+money(h.at(-1).c)+'\n最終ティック '+jst(tick)+' JST｜確認 '+jst(now())+' JST';
+            assert(Number.isFinite(tick),'missing tick timestamp');
+            console.log(report);
+            if (process.env.LOCAL_CHECK==='1') return;
+            assert(/^[A-Za-z0-9_-]{24,64}$/.test(process.env.NTFY_TOPIC||''),'Configure NTFY_TOPIC');
+            const saved=await stateApi('GET');
+            if (process.env.TEST_PUSH==='true') return notify({title:'XAUUSD 接続テスト',message:report});
+            if (state!=='同期済み') return;
+            const s=eligible(m,h,saved.last);
+            if (!s) return;
+            // Claim before sending. After an uncertain delivery do not resend automatically.
+            await stateApi('PUT',{message:'Record alert time',sha:saved.sha,
+              content:Buffer.from(JSON.stringify({last:s.end})+'\n').toString('base64')});
+            await notify(message(s,tick));
+          }
+          module.exports={bars,setup,status,eligible,message,notify,run};
+          if (require.main===module) run().catch(e=>{console.error(e.message);process.exitCode=1;});
+          MONITOR_JS
+          node "$RUNNER_TEMP/xauusd.cjs"
