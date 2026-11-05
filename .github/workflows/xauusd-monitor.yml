@@ -1,7 +1,7 @@
 name: XAUUSD monitor
 on:
   schedule:
-    - cron: '3,18,33,48 * * * *'
+    - cron: '*/5 * * * *'
   workflow_dispatch:
     inputs:
       test_push:
@@ -141,7 +141,6 @@ jobs:
             if (!s) {trace('通知見送り：シグナル条件未成立。'); return null;}
             if (setup(m,h,i-1)?.d===s.d) {trace('通知見送り：前回足でも同方向の条件成立（継続シグナル）。'); return null;}
             if (last>=s.end) {trace('通知見送り：同じ足またはそれ以降を通知処理済み。'); return null;}
-            if (last && m[i-15].t+M<=last) {trace('通知見送り：前回の通知処理から待機期間内（15本）。'); return null;}
             trace('通知対象：'+(s.d===1?'上昇':'下落')+'の新規シグナル。');
             return s;
           }
@@ -170,14 +169,51 @@ jobs:
             const r=await fetch(base+(method==='GET'?'?ref='+encodeURIComponent(branch):''),{method,
               headers:{Authorization:'Bearer '+process.env.GH_TOKEN,'Content-Type':'application/json'},
               body:body && JSON.stringify({...body,branch}),signal:AbortSignal.timeout(10000)});
-            if (r.status===404 && method==='GET') return {last:0};
+            if (r.status===404 && method==='GET') return {last:0,signals:[]};
             assert(r.ok,'GitHub state HTTP '+r.status);
             const data=await r.json();
             if (method==='GET') {
-              const {last}=JSON.parse(Buffer.from(data.content,'base64').toString());
-              assert(Number.isSafeInteger(last)&&last>0);
-              return {last,sha:data.sha};
+              const saved=JSON.parse(Buffer.from(data.content,'base64').toString());
+              assert(Number.isSafeInteger(saved.last)&&saved.last>=0);
+              assert(saved.signals===undefined || Array.isArray(saved.signals));
+              return {...saved,signals:saved.signals||[],sha:data.sha};
             }
+            return data.content.sha;
+          }
+          // Outcomes use the signal candle close, not an executable broker fill price.
+          // Keep the latest 500 signal records; older versions remain in Git history.
+          async function saveState(saved) {
+            const {sha,...body}=saved;
+            saved.sha=await stateApi('PUT',{message:'Update signal evaluation records',sha,
+              content:Buffer.from(JSON.stringify(body,null,2)+'\n').toString('base64')});
+          }
+          function updateOutcomes(saved,m) {
+            let changed=false;
+            for (const record of saved.signals) {
+              record.outcomes ||= {};
+              for (const minutes of [15,60]) {
+                if (record.outcomes[minutes]) continue;
+                const target=record.end+minutes*60;
+                if (m.at(-1).t+M<target) continue;
+                const rows=m.filter(v=>v.t>=record.end && v.t+M<=target);
+                const complete=rows.length===minutes/15 && rows.every((v,i)=>v.t===record.end+i*M);
+                if (!complete) {
+                  record.outcomes[minutes]={status:'unavailable',reason:'missing_candles_or_market_closed'};
+                  log('結果記録：'+jst(record.end)+' / '+minutes+'分後は欠損・休場のため評価不可。');
+                } else {
+                  const close=rows.at(-1).c;
+                  const high=Math.max(...rows.map(v=>v.h)),low=Math.min(...rows.map(v=>v.l));
+                  const round=n=>Number(n.toFixed(5));
+                  record.outcomes[minutes]={status:'complete',close,
+                    directionalChange:round(record.d*(close-record.price)),
+                    favorableExcursion:round(Math.max(0,record.d===1?high-record.price:record.price-low)),
+                    adverseExcursion:round(Math.max(0,record.d===1?record.price-low:high-record.price))};
+                  log('結果記録：'+jst(record.end)+' / '+minutes+'分後 / 方向別値幅 '+money(record.outcomes[minutes].directionalChange)+' USD（コスト未控除）。');
+                }
+                changed=true;
+              }
+            }
+            return changed;
           }
           async function run() {
             const clock=now();
@@ -200,17 +236,27 @@ jobs:
               log('接続テスト：条件判定の結果にかかわらずテスト通知のみ送ります。通常シグナル・通知履歴は更新しません。');
               return notify({title:'XAUUSD 接続テスト',message:report});
             }
+            const updated=updateOutcomes(saved,m);
+            if (updated) await saveState(saved);
+            log('記録済みシグナル：'+saved.signals.length+'件（直近500件を保持）。');
             if (state!=='同期済み') {log('通知見送り：休場・更新待ち（ティック鮮度または確定足時刻が同期条件外）。'); return;}
             const s=eligible(m,h,saved.last,log);
             if (!s) return;
-            // Claim before sending. After an uncertain delivery do not resend automatically.
-            await stateApi('PUT',{message:'Record alert time',sha:saved.sha,
-              content:Buffer.from(JSON.stringify({last:s.end})+'\n').toString('base64')});
-            log('通知処理対象の時刻を保存しました。');
+            // Claim before sending to prevent duplicate delivery after an uncertain response.
+            saved.last=s.end;
+            const record={end:s.end,detectedAt:now(),d:s.d,price:s.a.c,level:s.level,
+              source:'Deriv Gold/USD',delivery:'pending_or_unknown',outcomes:{}};
+            saved.signals.push(record);
+            saved.signals=saved.signals.slice(-500);
+            await saveState(saved);
+            log('シグナルと重複防止の記録を保存しました。15分後・60分後の値動きを追跡します。');
             try {await notify(message(s,tick));}
-            catch (e) {log('通知送信失敗または結果不明：重複防止の記録は保存済みです。同じ足は自動再送しません。'); throw e;}
+            catch (e) {log('通知送信失敗または結果不明：記録は保存済みです。同じ足は自動再送しません。'); throw e;}
+            record.delivery='accepted_by_ntfy';
+            record.acceptedAt=now();
+            await saveState(saved);
           }
-          module.exports={bars,setup,status,eligible,message,notify,run};
+          module.exports={bars,setup,status,eligible,message,notify,run,updateOutcomes,stateApi,saveState};
           if (require.main===module) run().catch(e=>{log('エラー：'+e.message);process.exitCode=1;});
           MONITOR_JS
           node "$RUNNER_TEMP/xauusd.cjs"
