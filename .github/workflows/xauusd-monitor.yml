@@ -38,7 +38,7 @@ jobs:
           const now = () => Math.floor(Date.now() / 1000);
           const jst = t => new Date(t * 1000).toLocaleString('sv-SE', {timeZone:'Asia/Tokyo'});
           const money = n => n.toFixed(2);
-
+          
           async function history(seconds, end) {
             const request = {ticks_history:symbol, end, count:seconds ? 650 : 1, adjust_start_time:1,
               style:seconds ? 'candles' : 'ticks'};
@@ -64,25 +64,41 @@ jobs:
               };
             });
           }
-
+          
           function bars(raw, step, end) {
             const out = [];
             let fast, slow;
+            const rows = new Map();
+            let lastIrregular = -Infinity;
             for (const row of raw) {
               const t = Number(row.epoch);
+              assert(row.epoch != null && row.epoch !== '' && Number.isSafeInteger(t) && t > 0 && t < 1e11,
+                'Unexpected '+step+'s candle timestamp: '+row.epoch);
+              if (t >= end) continue;
+              if (t % step !== 0) {
+                lastIrregular = Math.max(lastIrregular, t);
+                continue;
+              }
               if (t + step > end) continue;
-              const [o,h,l,c] = ['open','high','low','close'].map(k => Number(row[k]));
-              assert(Number.isInteger(t) && t % step === 0 && (!out.length || t > out.at(-1).t));
+              const values = ['open','high','low','close'].map(k => Number(row[k]));
+              const previous = rows.get(t);
+              if (previous && !values.every((value,i) => previous[i] === value))
+                lastIrregular = Math.max(lastIrregular,t);
+              rows.set(t,values);
+            }
+            for (const t of [...rows.keys()].sort((a,b) => a-b)) {
+              if (t <= lastIrregular) continue;
+              const [o,h,l,c] = rows.get(t);
               assert([o,h,l,c].every(n => Number.isFinite(n) && n > 0));
               assert(l <= Math.min(o,c) && h >= Math.max(o,c));
               fast = fast === undefined ? c : fast + 2/21*(c-fast);
               slow = slow === undefined ? c : slow + 2/51*(c-slow);
               out.push({t,h,l,c,fast,slow});
             }
-            assert(out.length >= 160, 'insufficient EMA warmup');
+            assert(out.length >= 160, step+'s candles: only '+out.length+' usable after timestamp check. Last irregular epoch: '+lastIrregular);
             return out;
           }
-
+          
           function setup(m,h,i) {
             const a=m[i], b=m[i-1], end=a.t+M;
             const k=h.findLastIndex(v => v.t+H<=end);
@@ -96,7 +112,7 @@ jobs:
             }
             return null;
           }
-
+          
           function status(m,h,tick,clock) {
             const end=m.at(-1).t+M;
             if (!Number.isFinite(tick) || tick>clock+5 || clock-tick>180 || end>tick ||
