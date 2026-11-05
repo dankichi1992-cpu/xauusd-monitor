@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 4
     steps:
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: '24'
           package-manager-cache: false
@@ -33,7 +33,12 @@ jobs:
           cat > "$RUNNER_TEMP/xauusd.cjs" <<'MONITOR_JS'
           'use strict';
           const assert = require('node:assert/strict');
+          const {appendFileSync} = require('node:fs');
           const M = 900, H = 3600;
+          function log(text) {
+            console.log(text);
+            if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, text+'\n\n');
+          }
           const symbol = 'frxXAUUSD';
           const now = () => Math.floor(Date.now() / 1000);
           const jst = t => new Date(t * 1000).toLocaleString('sv-SE', {timeZone:'Asia/Tokyo'});
@@ -99,16 +104,28 @@ jobs:
             return out;
           }
           
-          function setup(m,h,i) {
+          function setup(m,h,i,trace=()=>{}) {
             const a=m[i], b=m[i-1], end=a.t+M;
             const k=h.findLastIndex(v => v.t+H<=end);
-            if (k<150 || h[k].t+H !== Math.floor(end/H)*H || b.t+M!==a.t) return null;
+            if (k<150 || h[k].t+H !== Math.floor(end/H)*H || b.t+M!==a.t) {
+              trace('判定不可：1時間足不足・時刻不一致、または15分足が連続していません。');
+              return null;
+            }
             const u=h[k], range=m.slice(i-13,i-1);
             for (const d of [1,-1]) {
-              const trend=(v,prev)=>d*(v.c-v.fast)>0 && d*(v.fast-v.slow)>0 && d*(v.fast-prev.fast)>0;
               const level=d===1 ? Math.max(...range.map(v=>v.h)) : Math.min(...range.map(v=>v.l));
-              if (d*(a.c-level)>0 && d*(b.c-level)>0 && trend(a,m[i-2]) && trend(u,h[k-1]))
-                return {d,level,a,b,u,end};
+              const checks=[
+                ['最新15分終値が基準を突破',d*(a.c-level)>0],
+                ['前回15分終値も基準を突破',d*(b.c-level)>0],
+                ['15分終値とEMA20の位置',d*(a.c-a.fast)>0],
+                ['15分EMA20とEMA50の位置',d*(a.fast-a.slow)>0],
+                ['15分EMA20の傾き（2本前比）',d*(a.fast-m[i-2].fast)>0],
+                ['1時間終値とEMA20の位置',d*(u.c-u.fast)>0],
+                ['1時間EMA20とEMA50の位置',d*(u.fast-u.slow)>0],
+                ['1時間EMA20の傾き（1本前比）',d*(u.fast-h[k-1].fast)>0]
+              ];
+              trace((d===1?'上昇':'下落')+'判定｜基準 '+money(level)+'｜'+checks.map(([label,ok])=>label+': '+(ok?'OK':'未達')).join(' / '));
+              if (checks.every(([,ok])=>ok)) return {d,level,a,b,u,end};
             }
             return null;
           }
@@ -119,9 +136,13 @@ jobs:
                 end!==Math.floor(clock/M)*M || h.at(-1).t+H!==Math.floor(end/H)*H) return '休場・更新待ち';
             return '同期済み';
           }
-          function eligible(m,h,last) {
-            const i=m.length-1, s=setup(m,h,i);
-            if (!s || setup(m,h,i-1)?.d===s.d || last>=s.end || (last && m[i-15].t+M<=last)) return null;
+          function eligible(m,h,last,trace=()=>{}) {
+            const i=m.length-1, s=setup(m,h,i,trace);
+            if (!s) {trace('通知見送り：シグナル条件未成立。'); return null;}
+            if (setup(m,h,i-1)?.d===s.d) {trace('通知見送り：前回足でも同方向の条件成立（継続シグナル）。'); return null;}
+            if (last>=s.end) {trace('通知見送り：同じ足またはそれ以降を通知処理済み。'); return null;}
+            if (last && m[i-15].t+M<=last) {trace('通知見送り：前回の通知処理から待機期間内（15本）。'); return null;}
+            trace('通知対象：'+(s.d===1?'上昇':'下落')+'の新規シグナル。');
             return s;
           }
           function message(s,tick) {
@@ -141,6 +162,7 @@ jobs:
               body:JSON.stringify({topic,...payload}),signal:AbortSignal.timeout(10000)});
             if (!r.ok) throw new Error('ntfy HTTP '+r.status);
             assert((await r.json()).id,'ntfy did not return a message ID');
+            log('通知送信：ntfyが受理しました（HTTP '+r.status+'）。端末での表示は別途確認してください。');
           }
           async function stateApi(method,body) {
             const branch=process.env.GITHUB_REF_NAME;
@@ -165,20 +187,30 @@ jobs:
             const report='Deriv XAUUSD｜'+state+'\n15分足 '+jst(m.at(-1).t+M)+' JST 終値 '+money(m.at(-1).c)+
               '\n1時間足 '+jst(h.at(-1).t+H)+' JST 終値 '+money(h.at(-1).c)+'\n最終ティック '+jst(tick)+' JST｜確認 '+jst(now())+' JST';
             assert(Number.isFinite(tick),'missing tick timestamp');
-            console.log(report);
+            log(report);
+            log('実行種別：'+(process.env.GITHUB_EVENT_NAME||'local')+'｜接続テスト：'+(process.env.TEST_PUSH==='true'?'ON':'OFF'));
+            for (const [label,v] of [['15分',m.at(-1)],['1時間',h.at(-1)]])
+              log(label+' EMA20 '+money(v.fast)+' / EMA50 '+money(v.slow));
             if (process.env.LOCAL_CHECK==='1') return;
             assert(/^[A-Za-z0-9_-]{24,64}$/.test(process.env.NTFY_TOPIC||''),'Configure NTFY_TOPIC');
             const saved=await stateApi('GET');
-            if (process.env.TEST_PUSH==='true') return notify({title:'XAUUSD 接続テスト',message:report});
-            if (state!=='同期済み') return;
-            const s=eligible(m,h,saved.last);
+            log('最終通知処理対象：'+(saved.last?jst(saved.last)+' JST':'記録なし'));
+            if (process.env.TEST_PUSH==='true') {
+              eligible(m,h,saved.last,log);
+              log('接続テスト：条件判定の結果にかかわらずテスト通知のみ送ります。通常シグナル・通知履歴は更新しません。');
+              return notify({title:'XAUUSD 接続テスト',message:report});
+            }
+            if (state!=='同期済み') {log('通知見送り：休場・更新待ち（ティック鮮度または確定足時刻が同期条件外）。'); return;}
+            const s=eligible(m,h,saved.last,log);
             if (!s) return;
             // Claim before sending. After an uncertain delivery do not resend automatically.
             await stateApi('PUT',{message:'Record alert time',sha:saved.sha,
               content:Buffer.from(JSON.stringify({last:s.end})+'\n').toString('base64')});
-            await notify(message(s,tick));
+            log('通知処理対象の時刻を保存しました。');
+            try {await notify(message(s,tick));}
+            catch (e) {log('通知送信失敗または結果不明：重複防止の記録は保存済みです。同じ足は自動再送しません。'); throw e;}
           }
           module.exports={bars,setup,status,eligible,message,notify,run};
-          if (require.main===module) run().catch(e=>{console.error(e.message);process.exitCode=1;});
+          if (require.main===module) run().catch(e=>{log('エラー：'+e.message);process.exitCode=1;});
           MONITOR_JS
           node "$RUNNER_TEMP/xauusd.cjs"
