@@ -8,8 +8,9 @@
       "price": 4072.62,
       "level": 4070.28,
       "source": "Deriv Gold/USD",
-      "delivery": "pending_or_unknown",
-      "outcomes": {}
+      "delivery": "accepted_by_ntfy",
+      "outcomes": {},
+      "acceptedAt": 1793992531
     }
   ],
   "trendObservation": {
@@ -17,6 +18,7 @@
     "key": "ema-state-v1:1:1",
     "m15": 1,
     "h1": 1,
-    "delivery": "pending_or_unknown"
+    "delivery": "accepted_by_ntfy",
+    "acceptedAt": 1793992531
   }
 }
