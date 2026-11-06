@@ -2,11 +2,10 @@
   "last": 0,
   "signals": [],
   "trendObservation": {
-    "end": 1793978100,
-    "key": "ema-state-v1:0:0",
-    "m15": 0,
+    "end": 1793979000,
+    "key": "ema-state-v1:-1:0",
+    "m15": -1,
     "h1": 0,
-    "delivery": "accepted_by_ntfy",
-    "acceptedAt": 1793978131
+    "delivery": "pending_or_unknown"
   }
 }
