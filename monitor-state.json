@@ -6,6 +6,7 @@
     "key": "ema-state-v1:0:0",
     "m15": 0,
     "h1": 0,
-    "delivery": "pending_or_unknown"
+    "delivery": "accepted_by_ntfy",
+    "acceptedAt": 1793968242
   }
 }
