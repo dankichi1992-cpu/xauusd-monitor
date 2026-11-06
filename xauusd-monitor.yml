@@ -1,0 +1,321 @@
+# 状態通知版：予測精度の改善を実証したものではありません。
+# 初回とM15/H1のEMA状態変化で通知。同じ状態は再通知しません。
+# 既存ブレイク条件・評価履歴は維持。重なる通知は1件にまとめます。
+# 更新待ちはログのみ。通知失敗・結果不明は重複防止のため自動再送しません。
+# 導入：このファイルを .github/workflows/xauusd-monitor.yml に全文置換。
+# テスト：Run workflow の接続テストをON。定期実行ではfalseにしてください。
+name: XAUUSD monitor
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      test_push:
+        description: '実データの接続テストをiPhoneへ送る'
+        type: boolean
+        default: true
+permissions:
+  contents: write
+concurrency:
+  group: xauusd-monitor
+  cancel-in-progress: false
+jobs:
+  monitor:
+    if: github.event.repository.private == false && github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Check closed gold candles
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          TEST_PUSH: ${{ github.event.inputs.test_push }}
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/xauusd.cjs" <<'MONITOR_JS'
+          'use strict';
+          const assert = require('node:assert/strict');
+          const {appendFileSync} = require('node:fs');
+          const M = 900, H = 3600;
+          function log(text) {
+            console.log(text);
+            if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, text+'\n\n');
+          }
+          const symbol = 'frxXAUUSD';
+          const now = () => Math.floor(Date.now() / 1000);
+          const jst = t => new Date(t * 1000).toLocaleString('sv-SE', {timeZone:'Asia/Tokyo'});
+          const money = n => n.toFixed(2);
+          
+          async function history(seconds, end) {
+            const request = {ticks_history:symbol, end, count:seconds ? 650 : 1, adjust_start_time:1,
+              style:seconds ? 'candles' : 'ticks'};
+            if (seconds) request.granularity = seconds;
+            return new Promise((resolve,reject) => {
+              const ws = new WebSocket('wss://api.derivws.com/trading/v1/options/ws/public');
+              const timer = setTimeout(() => done(new Error('Deriv timed out')), 25000);
+              function done(error, body) {
+                clearTimeout(timer);
+                ws.close();
+                if (error) reject(error); else resolve(body);
+              }
+              ws.onopen = () => ws.send(JSON.stringify(request));
+              ws.onerror = () => done(new Error('Deriv connection failed'));
+              ws.onclose = () => {clearTimeout(timer); reject(new Error('Deriv closed the connection'));};
+              ws.onmessage = event => {
+                try {
+                  const data = JSON.parse(event.data);
+                  if (data.error) throw new Error('Deriv: ' + data.error.code);
+                  assert.equal(data.echo_req.ticks_history,symbol);
+                  done(null, seconds ? data.candles : Number(data.history.times.at(-1)));
+                } catch (e) {done(e);}
+              };
+            });
+          }
+          
+          function bars(raw, step, end) {
+            const out = [];
+            let fast, slow;
+            const rows = new Map();
+            let lastIrregular = -Infinity;
+            for (const row of raw) {
+              const t = Number(row.epoch);
+              assert(row.epoch != null && row.epoch !== '' && Number.isSafeInteger(t) && t > 0 && t < 1e11,
+                'Unexpected '+step+'s candle timestamp: '+row.epoch);
+              if (t >= end) continue;
+              if (t % step !== 0) {
+                lastIrregular = Math.max(lastIrregular, t);
+                continue;
+              }
+              if (t + step > end) continue;
+              const values = ['open','high','low','close'].map(k => Number(row[k]));
+              const previous = rows.get(t);
+              if (previous && !values.every((value,i) => previous[i] === value))
+                lastIrregular = Math.max(lastIrregular,t);
+              rows.set(t,values);
+            }
+            for (const t of [...rows.keys()].sort((a,b) => a-b)) {
+              if (t <= lastIrregular) continue;
+              const [o,h,l,c] = rows.get(t);
+              assert([o,h,l,c].every(n => Number.isFinite(n) && n > 0));
+              assert(l <= Math.min(o,c) && h >= Math.max(o,c));
+              fast = fast === undefined ? c : fast + 2/21*(c-fast);
+              slow = slow === undefined ? c : slow + 2/51*(c-slow);
+              out.push({t,h,l,c,fast,slow});
+            }
+            assert(out.length >= 160, step+'s candles: only '+out.length+' usable after timestamp check. Last irregular epoch: '+lastIrregular);
+            return out;
+          }
+          
+          function setup(m,h,i,trace=()=>{}) {
+            const a=m[i], b=m[i-1], end=a.t+M;
+            const k=h.findLastIndex(v => v.t+H<=end);
+            if (k<150 || h[k].t+H !== Math.floor(end/H)*H || b.t+M!==a.t) {
+              trace('判定不可：1時間足不足・時刻不一致、または15分足が連続していません。');
+              return null;
+            }
+            const u=h[k], range=m.slice(i-13,i-1);
+            for (const d of [1,-1]) {
+              const level=d===1 ? Math.max(...range.map(v=>v.h)) : Math.min(...range.map(v=>v.l));
+              const checks=[
+                ['最新15分終値が基準を突破',d*(a.c-level)>0],
+                ['前回15分終値も基準を突破',d*(b.c-level)>0],
+                ['15分終値とEMA20の位置',d*(a.c-a.fast)>0],
+                ['15分EMA20とEMA50の位置',d*(a.fast-a.slow)>0],
+                ['15分EMA20の傾き（2本前比）',d*(a.fast-m[i-2].fast)>0],
+                ['1時間終値とEMA20の位置',d*(u.c-u.fast)>0],
+                ['1時間EMA20とEMA50の位置',d*(u.fast-u.slow)>0],
+                ['1時間EMA20の傾き（1本前比）',d*(u.fast-h[k-1].fast)>0]
+              ];
+              trace((d===1?'上昇':'下落')+'判定｜基準 '+money(level)+'｜'+checks.map(([label,ok])=>label+': '+(ok?'OK':'未達')).join(' / '));
+              if (checks.every(([,ok])=>ok)) return {d,level,a,b,u,end};
+            }
+            return null;
+          }
+          
+          function status(m,h,tick,clock) {
+            const end=m.at(-1).t+M;
+            if (!Number.isFinite(tick) || tick>clock+5 || clock-tick>180 || end>tick ||
+                end!==Math.floor(clock/M)*M || h.at(-1).t+H!==Math.floor(end/H)*H) return '休場・更新待ち';
+            return '同期済み';
+          }
+          function eligible(m,h,last,trace=()=>{}) {
+            const i=m.length-1, s=setup(m,h,i,trace);
+            if (!s) {trace('通知見送り：シグナル条件未成立。'); return null;}
+            if (setup(m,h,i-1)?.d===s.d) {trace('通知見送り：前回足でも同方向の条件成立（継続シグナル）。'); return null;}
+            if (last>=s.end) {trace('通知見送り：同じ足またはそれ以降を通知処理済み。'); return null;}
+            trace('通知対象：'+(s.d===1?'上昇':'下落')+'の新規シグナル。');
+            return s;
+          }
+          function message(s,tick) {
+            const up=s.d===1, side=up?'上昇':'下落', op=up?'＞':'＜';
+            return {title:'XAUUSD '+side+'ブレイク条件成立｜確定足',message:[
+              '確認価格 '+money(s.a.c)+' USD　'+jst(s.end)+' JST',
+              '直前12本の'+(up?'高値':'安値')+' '+money(s.level)+' を更新。15分終値 '+money(s.b.c)+' → '+money(s.a.c)+' で定着。',
+              ...[['15分',s.a],['1時間',s.u]].map(([name,v])=>name+' 終値 '+money(v.c)+op+'EMA20 '+money(v.fast)+op+'EMA50 '+money(v.slow)+'、EMA20は'+side),
+              '否定条件：15分終値が '+money(s.level)+' を'+(up?'下回る':'上回る')+'。',
+              '1時間足確定 '+jst(s.u.t+H)+' JST　最終ティック '+jst(tick)+' JST',
+              '判定 '+jst(now())+' JST｜Deriv Gold/USD',
+              '検証で高い予測精度は確認できていません。売買・両建て解除の指示ではありません。'].join('\n')};
+          }
+          // Descriptive EMA state, not a forecast or a trade instruction.
+          function trendState(m,h) {
+            const end=m.at(-1).t+M;
+            function direction(rows,step,lag) {
+              const i=rows.length-1;
+              if(i<159) return null;
+              for(let j=i-lag+1;j<=i;j++) if(rows[j].t!==rows[j-1].t+step) return null;
+              const a=rows[i],b=rows[i-lag];
+              if(![a.c,a.fast,a.slow,b.fast].every(Number.isFinite)) return null;
+              return a.c>a.fast && a.fast>a.slow && a.fast>b.fast ? 1 :
+                a.c<a.fast && a.fast<a.slow && a.fast<b.fast ? -1 : 0;
+            }
+            const md=direction(m,M,2),hd=direction(h,H,1);
+            if(md===null||hd===null||h.at(-1).t+H!==Math.floor(end/H)*H)
+              return {available:false,end,text:'トレンド状態：判定不可（足不足・時刻不一致）'};
+            const label=d=>d===1?'上昇配列':d===-1?'下落配列':'中立・条件混在';
+            const key='ema-state-v1:'+md+':'+hd;
+            const title=md===hd && md!==0 ? (md===1?'両足で上昇配列':'両足で下落配列') :
+              md*hd===-1 ? '15分と1時間の方向不一致' : '中立を含む状態';
+            const text=[
+              '15分足：'+label(md)+'｜終値 '+money(m.at(-1).c)+' / EMA20 '+money(m.at(-1).fast)+' / EMA50 '+money(m.at(-1).slow),
+              '1時間足：'+label(hd)+'｜終値 '+money(h.at(-1).c)+' / EMA20 '+money(h.at(-1).fast)+' / EMA50 '+money(h.at(-1).slow),
+              '15分足確定 '+jst(end)+' JST / 1時間足確定 '+jst(h.at(-1).t+H)+' JST',
+              '現在のEMA配列と傾きの観測です。次の値動きや両建て解除の合図ではありません。'
+            ].join('\n');
+            return {available:true,end,key,md,hd,title,text};
+          }
+          function observationChanged(saved,observation) {
+            if(!observation.available) return false;
+            const old=saved.trendObservation;
+            if(!old) return true;
+            assert(Number.isSafeInteger(old.end)&&old.end>=0&&typeof old.key==='string','Invalid trend state');
+            return observation.end>old.end && observation.key!==old.key;
+          }
+          
+          async function notify(payload) {
+            const topic=process.env.NTFY_TOPIC;
+            assert(/^[A-Za-z0-9_-]{24,64}$/.test(topic||''),'NTFY_TOPIC must be 24–64 random URL-safe characters');
+            const r=await fetch('https://ntfy.sh',{method:'POST',headers:{'Content-Type':'application/json'},
+              body:JSON.stringify({topic,...payload}),signal:AbortSignal.timeout(10000)});
+            if (!r.ok) throw new Error('ntfy HTTP '+r.status);
+            assert((await r.json()).id,'ntfy did not return a message ID');
+            log('通知送信：ntfyが受理しました（HTTP '+r.status+'）。端末での表示は別途確認してください。');
+          }
+          async function stateApi(method,body) {
+            const branch=process.env.GITHUB_REF_NAME;
+            const base='https://api.github.com/repos/'+process.env.GITHUB_REPOSITORY+'/contents/monitor-state.json';
+            const r=await fetch(base+(method==='GET'?'?ref='+encodeURIComponent(branch):''),{method,
+              headers:{Authorization:'Bearer '+process.env.GH_TOKEN,'Content-Type':'application/json'},
+              body:body && JSON.stringify({...body,branch}),signal:AbortSignal.timeout(10000)});
+            if (r.status===404 && method==='GET') return {last:0,signals:[]};
+            assert(r.ok,'GitHub state HTTP '+r.status);
+            const data=await r.json();
+            if (method==='GET') {
+              const saved=JSON.parse(Buffer.from(data.content,'base64').toString());
+              assert(Number.isSafeInteger(saved.last)&&saved.last>=0);
+              assert(saved.signals===undefined || Array.isArray(saved.signals));
+              return {...saved,signals:saved.signals||[],sha:data.sha};
+            }
+            return data.content.sha;
+          }
+          // Outcomes use the signal candle close, not an executable broker fill price.
+          // Keep the latest 500 signal records; older versions remain in Git history.
+          async function saveState(saved) {
+            const {sha,...body}=saved;
+            saved.sha=await stateApi('PUT',{message:'Update signal evaluation records',sha,
+              content:Buffer.from(JSON.stringify(body,null,2)+'\n').toString('base64')});
+          }
+          function updateOutcomes(saved,m) {
+            let changed=false;
+            for (const record of saved.signals) {
+              record.outcomes ||= {};
+              for (const minutes of [15,60]) {
+                if (record.outcomes[minutes]) continue;
+                const target=record.end+minutes*60;
+                if (m.at(-1).t+M<target) continue;
+                const rows=m.filter(v=>v.t>=record.end && v.t+M<=target);
+                const complete=rows.length===minutes/15 && rows.every((v,i)=>v.t===record.end+i*M);
+                if (!complete) {
+                  record.outcomes[minutes]={status:'unavailable',reason:'missing_candles_or_market_closed'};
+                  log('結果記録：'+jst(record.end)+' / '+minutes+'分後は欠損・休場のため評価不可。');
+                } else {
+                  const close=rows.at(-1).c;
+                  const high=Math.max(...rows.map(v=>v.h)),low=Math.min(...rows.map(v=>v.l));
+                  const round=n=>Number(n.toFixed(5));
+                  record.outcomes[minutes]={status:'complete',close,
+                    directionalChange:round(record.d*(close-record.price)),
+                    favorableExcursion:round(Math.max(0,record.d===1?high-record.price:record.price-low)),
+                    adverseExcursion:round(Math.max(0,record.d===1?record.price-low:high-record.price))};
+                  log('結果記録：'+jst(record.end)+' / '+minutes+'分後 / 方向別値幅 '+money(record.outcomes[minutes].directionalChange)+' USD（コスト未控除）。');
+                }
+                changed=true;
+              }
+            }
+            return changed;
+          }
+          async function run(deps={}) {
+            const getHistory=deps.history||history, readState=deps.stateApi||stateApi;
+            const persist=deps.saveState||saveState, send=deps.notify||notify;
+            const clockNow=deps.now||now;
+            const clock=clockNow();
+            const [mraw,hraw,tick]=await Promise.all([getHistory(M,'latest'),getHistory(H,'latest'),getHistory(0,'latest')]);
+            const m=bars(mraw,M,clock), h=bars(hraw,H,clock);
+            const state=status(m,h,tick,clockNow());
+            const report='Deriv XAUUSD｜'+state+'\n15分足 '+jst(m.at(-1).t+M)+' JST 終値 '+money(m.at(-1).c)+
+              '\n1時間足 '+jst(h.at(-1).t+H)+' JST 終値 '+money(h.at(-1).c)+'\n最終ティック '+jst(tick)+' JST｜確認 '+jst(now())+' JST';
+            assert(Number.isFinite(tick),'missing tick timestamp');
+            log(report);
+            log('実行種別：'+(process.env.GITHUB_EVENT_NAME||'local')+'｜接続テスト：'+(process.env.TEST_PUSH==='true'?'ON':'OFF'));
+            for (const [label,v] of [['15分',m.at(-1)],['1時間',h.at(-1)]])
+              log(label+' EMA20 '+money(v.fast)+' / EMA50 '+money(v.slow));
+            const observation=trendState(m,h);
+            log(observation.text);
+            if (process.env.LOCAL_CHECK==='1') return;
+            assert(/^[A-Za-z0-9_-]{24,64}$/.test(process.env.NTFY_TOPIC||''),'Configure NTFY_TOPIC');
+            const saved=await readState('GET');
+            log('最終通知処理対象：'+(saved.last?jst(saved.last)+' JST':'記録なし'));
+            if (process.env.TEST_PUSH==='true') {
+              eligible(m,h,saved.last,log);
+              log('接続テスト：条件判定の結果にかかわらずテスト通知のみ送ります。通常シグナル・通知履歴は更新しません。');
+              return send({title:'XAUUSD 接続テスト',message:report+'\n\n'+(state==='同期済み'?observation.text:'データ更新待ちのためトレンド方向は通知しません。')});
+            }
+            const updated=updateOutcomes(saved,m);
+            if (updated) await persist(saved);
+            log('記録済みシグナル：'+saved.signals.length+'件（直近500件を保持）。');
+            if (state!=='同期済み') {log('通知見送り：休場・更新待ち（ティック鮮度または確定足時刻が同期条件外）。'); return;}
+            const s=eligible(m,h,saved.last,log);
+            const changed=observationChanged(saved,observation);
+            if(!s&&!changed) {log('トレンド通知見送り：状態変化なし、または判定不可。稼働結果はこのログで確認できます。');return;}
+            let record;
+            if(s) {
+              saved.last=s.end;
+              record={end:s.end,detectedAt:clockNow(),d:s.d,price:s.a.c,level:s.level,
+                source:'Deriv Gold/USD',delivery:'pending_or_unknown',outcomes:{}};
+              saved.signals.push(record);
+              saved.signals=saved.signals.slice(-500);
+            }
+            if(changed) saved.trendObservation={end:observation.end,key:observation.key,
+              m15:observation.md,h1:observation.hd,delivery:'pending_or_unknown'};
+            const oldPayload=s?message(s,tick):null;
+            const payload={
+              title:s?'XAUUSD ブレイク条件成立＋トレンド状態':'XAUUSD 状態変化｜'+observation.title,
+              message:[observation.text,oldPayload?.message||'新規ブレイク条件の通知はありません。',
+                '最終ティック '+jst(tick)+' JST｜Deriv Gold/USD（Exnessとは別の価格源）',
+                '同じトレンド状態では再通知しません。'].join('\n\n')};
+            // Claim before sending; uncertain responses are not automatically retried.
+            await persist(saved);
+            try {await send(payload);}
+            catch(e) {log('通知失敗または結果不明。重複防止のため自動再送しません。接続テストで確認してください。');throw e;}
+            if(record){record.delivery='accepted_by_ntfy';record.acceptedAt=clockNow();}
+            if(changed){saved.trendObservation.delivery='accepted_by_ntfy';saved.trendObservation.acceptedAt=clockNow();}
+            await persist(saved);
+          }
+          
+          module.exports={trendState,observationChanged,bars,setup,status,eligible,message,notify,run,updateOutcomes,stateApi,saveState};
+          if (require.main===module) run().catch(e=>{log('エラー：'+e.message);process.exitCode=1;});
+          MONITOR_JS
+          node "$RUNNER_TEMP/xauusd.cjs"
