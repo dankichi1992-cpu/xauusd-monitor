@@ -1,5 +1,5 @@
 {
-  "last": 1794191400,
+  "last": 1794223800,
   "signals": [
     {
       "end": 1793992500,
@@ -104,14 +104,23 @@
         }
       },
       "acceptedAt": 1794191442
+    },
+    {
+      "end": 1794223800,
+      "detectedAt": 1794223844,
+      "d": 1,
+      "price": 4105.55,
+      "level": 4100.8,
+      "source": "Deriv Gold/USD",
+      "delivery": "pending_or_unknown",
+      "outcomes": {}
     }
   ],
   "trendObservation": {
-    "end": 1794214800,
-    "key": "ema-state-v1:0:1",
-    "m15": 0,
+    "end": 1794223800,
+    "key": "ema-state-v1:1:1",
+    "m15": 1,
     "h1": 1,
-    "delivery": "accepted_by_ntfy",
-    "acceptedAt": 1794214850
+    "delivery": "pending_or_unknown"
   }
 }
