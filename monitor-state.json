@@ -242,8 +242,9 @@
       "price": 4033.19,
       "level": 4039.76,
       "source": "Deriv Gold/USD",
-      "delivery": "pending_or_unknown",
-      "outcomes": {}
+      "delivery": "accepted_by_ntfy",
+      "outcomes": {},
+      "acceptedAt": 1794404731
     }
   ],
   "trendObservation": {
