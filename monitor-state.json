@@ -302,6 +302,13 @@
           "directionalChange": -2.98,
           "favorableExcursion": 2.31,
           "adverseExcursion": 3.26
+        },
+        "60": {
+          "status": "complete",
+          "close": 4005.26,
+          "directionalChange": 10.09,
+          "favorableExcursion": 14.46,
+          "adverseExcursion": 3.26
         }
       },
       "acceptedAt": 1794409250
@@ -314,7 +321,15 @@
       "level": 4010.97,
       "source": "Deriv Gold/USD",
       "delivery": "accepted_by_ntfy",
-      "outcomes": {},
+      "outcomes": {
+        "15": {
+          "status": "complete",
+          "close": 4005.26,
+          "directionalChange": 0.66,
+          "favorableExcursion": 5.03,
+          "adverseExcursion": 1.18
+        }
+      },
       "acceptedAt": 1794411933
     }
   ],
