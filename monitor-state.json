@@ -633,7 +633,15 @@
       "level": 3861.46,
       "source": "Deriv Gold/USD",
       "delivery": "accepted_by_ntfy",
-      "outcomes": {},
+      "outcomes": {
+        "15": {
+          "status": "complete",
+          "close": 3859.28,
+          "directionalChange": -0.55,
+          "favorableExcursion": 1.4,
+          "adverseExcursion": 2.45
+        }
+      },
       "acceptedAt": 1794845732
     }
   ],
