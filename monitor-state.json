@@ -692,6 +692,13 @@
           "directionalChange": -2.56,
           "favorableExcursion": 2.85,
           "adverseExcursion": 2.59
+        },
+        "60": {
+          "status": "complete",
+          "close": 3859.43,
+          "directionalChange": -1.96,
+          "favorableExcursion": 4.42,
+          "adverseExcursion": 2.59
         }
       },
       "acceptedAt": 1794911445
