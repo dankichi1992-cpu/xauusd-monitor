@@ -1,5 +1,5 @@
 {
-  "last": 1795102200,
+  "last": 1795104900,
   "signals": [
     {
       "end": 1793992500,
@@ -1007,6 +1007,16 @@
         }
       },
       "acceptedAt": 1795102240
+    },
+    {
+      "end": 1795104900,
+      "detectedAt": 1795104931,
+      "d": -1,
+      "price": 3678.66,
+      "level": 3683.06,
+      "source": "Deriv Gold/USD",
+      "delivery": "pending_or_unknown",
+      "outcomes": {}
     }
   ],
   "trendObservation": {
