@@ -1433,7 +1433,15 @@
       "level": 3454.45,
       "source": "Deriv Gold/USD",
       "delivery": "pending_or_unknown",
-      "outcomes": {}
+      "outcomes": {
+        "15": {
+          "status": "complete",
+          "close": 3445.41,
+          "directionalChange": -2.2,
+          "favorableExcursion": 4.21,
+          "adverseExcursion": 7.94
+        }
+      }
     }
   ],
   "trendObservation": {
