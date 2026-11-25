@@ -1349,11 +1349,10 @@
     }
   ],
   "trendObservation": {
-    "end": 1795575600,
-    "key": "ema-state-v1:-1:-1",
-    "m15": -1,
+    "end": 1795576500,
+    "key": "ema-state-v1:0:-1",
+    "m15": 0,
     "h1": -1,
-    "delivery": "accepted_by_ntfy",
-    "acceptedAt": 1795575657
+    "delivery": "pending_or_unknown"
   }
 }
